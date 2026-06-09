@@ -1,0 +1,66 @@
+﻿#include <windows.h>
+
+#define IDC_EDIT_MS               1001
+#define IDC_BTN_SET               1002
+#define IDC_BTN_MAX               1003
+#define IDC_BTN_DEFAULT           1004
+#define IDC_CHK_APPLY_STARTUP     1005
+#define IDC_CHK_TRAY              1006
+
+#define IDC_LBL_SIGNATURE         1010
+#define IDC_LBL_CURRENT_VALUE     1012
+#define IDC_LBL_MAXIMUM_VALUE     1014
+#define IDC_LBL_MINIMUM_VALUE     1016
+#define IDC_LINE1                 1020
+#define IDC_LINE2                 1021
+
+1 DIALOGEX 0,0,260,148
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "New Timer Resolution"
+FONT 9, "Segoe UI"
+{
+    EDITTEXT IDC_EDIT_MS,        10, 11, 115, 20, ES_MULTILINE | ES_AUTOHSCROLL | ES_CENTER | WS_TABSTOP
+    PUSHBUTTON "Set",            IDC_BTN_SET,      135, 10, 115, 20, WS_TABSTOP | BS_OWNERDRAW
+
+    PUSHBUTTON "Max",            IDC_BTN_MAX,      10, 36, 115, 20, WS_TABSTOP | BS_OWNERDRAW
+    PUSHBUTTON "Default",        IDC_BTN_DEFAULT,  135, 36, 115, 20, WS_TABSTOP | BS_OWNERDRAW
+
+    CONTROL "", IDC_LINE1, "STATIC", SS_LEFT, 10, 64, 240, 1
+
+    CONTROL "Apply at startup",          IDC_CHK_APPLY_STARTUP, "BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 72, 160, 10
+    CONTROL "Minimize to system tray",   IDC_CHK_TRAY,          "BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 84, 160, 10
+
+    CONTROL "", IDC_LINE2, "STATIC", SS_LEFT, 10, 98, 240, 1
+
+    LTEXT "current: --", IDC_LBL_CURRENT_VALUE, 10, 108, 130, 10, SS_LEFT
+    LTEXT "maximum: --", IDC_LBL_MAXIMUM_VALUE, 10, 118, 130, 10, SS_LEFT
+    LTEXT "minimum: --", IDC_LBL_MINIMUM_VALUE, 10, 128, 130, 10, SS_LEFT
+
+    LTEXT "Stressced", IDC_LBL_SIGNATURE, 195, 128, 55, 10, SS_RIGHT
+}
+
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "TimerResTool"
+            VALUE "FileDescription",  "Windows Timer Resolution Tool"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "timeres.exe"
+            VALUE "LegalCopyright",   "Public Domain"
+            VALUE "OriginalFilename", "timeres.exe"
+            VALUE "ProductName",      "Timer Resolution"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+1 24 "app.manifest"
