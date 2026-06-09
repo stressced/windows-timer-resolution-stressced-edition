@@ -1,0 +1,22 @@
+# Archivos de compilación
+build.log
+*.exe
+!timeres.exe
+
+# Archivos de prueba
+test.c
+test.rc
+
+# Archivos de captura de pantalla
+capture*.png
+capture_final*.png
+capture_v*.png
+
+# Archivos de parche
+patch*.txt
+
+# Scripts
+push-to-github.ps1
+
+# Guías
+GUÍA*.md
