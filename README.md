@@ -1,31 +1,48 @@
-# Guía para subir el código a GitHub
+# Timer Resolution Tool
 
-## Paso 1: Crear el repositorio en GitHub
+## Project Structure
+- timeres.c - Main source code
+- timeres.rc - Resource script (dialog layout)
+- app.manifest - Admin required + DPI aware manifest
+- push-to-github.ps1 - Script to push to GitHub
 
-1. Ve a: https://github.com/new
-2. Crea un nuevo repositorio con nombre: windows-timer-resolution-stressced-version
-3. Haz clic en "Create repository"
-
-## Paso 2: Configurar el repositorio local
-
-```
+## Build
+```powershell
 cd D:\timeres
-git remote add origin https://github.com/tu-usuario/windows-timer-resolution-stressced-version.git
+& "C:\msys64\msys2_shell.cmd" -defterm -no-start -ucrt64 -full-path -here -c "cd /d/timeres; x86_64-w64-mingw32-gcc -mwindows -O2 -Wall -o timeres.exe timeres.c timeres.rc -lkernel32 -luser32 -lgdi32 -lshell32"
 ```
 
-## Paso 3: Subir el código
+## Push to GitHub
 
-```
-git push -u origin master
-```
-
-## Alternativa: Usar el script
-
+### Option 1: Use the script
 ```
 cd D:\timeres
 .\push-to-github.ps1 TU_TOKEN
 ```
 
-Donde TU_TOKEN es un token personal de GitHub (puedes crear uno en: https://github.com/settings/tokens)
+### Option 2: Manual upload
+1. Create a repository on GitHub at: https://github.com/new
+2. Name it: `windows-timer-resolution-stressced-version`
+3. Copy the SSH URL
+4. Execute:
+   ```
+   git remote add origin git@github.com:carlosedt/windows-timer-resolution-stressced-version.git
+   git push -u origin master
+   ```
 
-El token debe tener el scope 'repo' (Control repositories)
+### Creating a GitHub Token
+1. Go to: https://github.com/settings/tokens
+2. Click "Generate new token"
+3. Name: "timeres-upload"
+4. Select scopes: `repo` (Full control)
+5. Generate and copy the token
+
+## Features
+- View and set Windows timer resolution
+- System tray icon
+- Auto-start capability
+- Single instance enforcement
+- Dark UI theme
+
+## Author
+- carlosedt <carlosedt@gmail.com>
