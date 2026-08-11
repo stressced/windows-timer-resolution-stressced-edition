@@ -7,6 +7,9 @@ build.log
 test.c
 test.rc
 
+# Copia local previa a los arreglos, superada por el historial de git
+timeres_backup.c
+
 # Archivos de captura de pantalla
 capture*.png
 capture_final*.png
