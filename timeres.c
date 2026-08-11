@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <shlobj.h>
 #include <string.h>
+#include <stdlib.h>
 
 typedef NTSTATUS (WINAPI *NtQueryTimerResolution_t)(
     PULONG MinimumResolution,
@@ -22,12 +23,15 @@ typedef NTSTATUS (WINAPI *NtSetTimerResolution_t)(
 #define IDC_BTN_DEFAULT           1004
 #define IDC_CHK_APPLY_STARTUP     1005
 #define IDC_CHK_TRAY              1006
+#define IDC_BTN_REFRESH           1007
+#define IDC_BTN_GLOBAL            1008
 
 #define IDC_LBL_SIGNATURE         1010
 
 #define IDC_LBL_CURRENT_VALUE     1012
 #define IDC_LBL_MAXIMUM_VALUE     1014
 #define IDC_LBL_MINIMUM_VALUE     1016
+#define IDC_LBL_GLOBAL_VALUE      1019
 
 #define IDC_LINE1                 1020
 #define IDC_LINE2                 1021
@@ -40,6 +44,13 @@ static const char REG_KEY[]       = "SOFTWARE\\TimerResTool";
 static const char REG_VAL_MS[]    = "MsValue";
 static const char REG_VAL_APPLY[] = "ApplyAtStartup";
 static const char REG_VAL_TRAY[]  = "TrayMin";
+static const char TASK_NAME[]     = "TimerResTool_ApplyAtStartup";
+
+// Without this machine-wide setting, Windows 10 2004+ services each process at the
+// resolution that process itself requested, so anything we set here affects nothing
+// but our own idle message loop. With it, our request applies system-wide again.
+static const char GTR_KEY[] = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel";
+static const char GTR_VAL[] = "GlobalTimerResolutionRequests";
 
 static COLORREF clrBg        = RGB(32, 32, 32);
 static COLORREF clrText      = RGB(220, 220, 220);
@@ -60,7 +71,11 @@ static HWND hChkTray = NULL;
 static HWND hLblCurVal = NULL;
 static HWND hLblMaxVal = NULL;
 static HWND hLblMinVal = NULL;
+static HWND hLblGlobal = NULL;
 static LONG_PTR gOldEditProc = 0;
+
+// Last value we asked for. 0 means we hold no request.
+static double gRequestedMs = 0.0;
 
 static NtQueryTimerResolution_t pNtQuery = NULL;
 static NtSetTimerResolution_t   pNtSet   = NULL;
@@ -74,8 +89,11 @@ static double ReadConfigMs(void)
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
         return val;
-    DWORD sz = sizeof(val);
-    (void)RegGetValueA(hKey, NULL, REG_VAL_MS, RRF_RT_REG_SZ, NULL, &val, &sz);
+    // Stored by WriteConfigMs as REG_SZ ("%.4f"), so read into a string and convert.
+    char buf[32] = {0};
+    DWORD sz = sizeof(buf);
+    if (RegGetValueA(hKey, NULL, REG_VAL_MS, RRF_RT_REG_SZ, NULL, buf, &sz) == ERROR_SUCCESS)
+        val = atof(buf);
     RegCloseKey(hKey);
     return val;
 }
@@ -87,7 +105,7 @@ static void WriteConfigMs(double ms)
         REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
         return;
     char buf[32];
-    sprintf_s(buf, sizeof(buf), "%.3f", ms);
+    sprintf_s(buf, sizeof(buf), "%.4f", ms);
     RegSetValueExA(hKey, REG_VAL_MS, 0, REG_SZ, (const BYTE*)buf, (DWORD)(strlen(buf)+1));
     RegCloseKey(hKey);
 }
@@ -116,6 +134,59 @@ static void WriteBoolConfig(const char* name, BOOL val)
     RegCloseKey(hKey);
 }
 
+static BOOL ReadGlobalMode(void)
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, GTR_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    DWORD val = 0, sz = sizeof(val), type = 0;
+    BOOL on = FALSE;
+    if (RegQueryValueExA(hKey, GTR_VAL, NULL, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS)
+        on = (type == REG_DWORD && val != 0);
+    RegCloseKey(hKey);
+    return on;
+}
+
+static BOOL SetGlobalMode(BOOL enable)
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, GTR_KEY, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    LONG r;
+    if (enable)
+    {
+        DWORD v = 1;
+        r = RegSetValueExA(hKey, GTR_VAL, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    }
+    else
+    {
+        // Remove the value rather than leaving a 0 behind, so the machine goes
+        // back to the stock Windows configuration.
+        r = RegDeleteValueA(hKey, GTR_VAL);
+        if (r == ERROR_FILE_NOT_FOUND) r = ERROR_SUCCESS;
+    }
+
+    RegCloseKey(hKey);
+    return (r == ERROR_SUCCESS);
+}
+
+static void RefreshGlobalMode(HWND hwndDlg)
+{
+    BOOL on = ReadGlobalMode();
+
+    if (hLblGlobal)
+        SetWindowTextA(hLblGlobal, on ? "global mode: ON"
+                                      : "global mode: OFF (per-process)");
+
+    HWND btn = GetDlgItem(hwndDlg, IDC_BTN_GLOBAL);
+    if (btn)
+    {
+        SetWindowTextA(btn, on ? "Disable global" : "Enable global");
+        InvalidateRect(btn, NULL, TRUE);   // owner-draw needs a nudge to repaint
+    }
+}
+
 static void LoadNtFunctions(void)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -141,12 +212,16 @@ static ULONG MsToUnits(double ms)
     return (ULONG)(ms * 10000.0 + 0.5);
 }
 
-static void SetTimerResolutionMs(double ms)
+// Returns the resolution the system actually granted, in 100 ns units, or 0 on
+// failure. This is the effective system-wide value (the finest outstanding request
+// from any process), not necessarily what we asked for.
+static ULONG SetTimerResolutionMs(double ms)
 {
-    if (!pNtSet || ms <= 0.0) return;
+    if (!pNtSet || ms <= 0.0) return 0;
     ULONG units = MsToUnits(ms);
-    ULONG actual;
-    (void)pNtSet(units, TRUE, &actual);
+    ULONG actual = 0;
+    if (pNtSet(units, TRUE, &actual) < 0) return 0;
+    return actual;
 }
 
 static void ReleaseTimerResolution(void)
@@ -156,37 +231,102 @@ static void ReleaseTimerResolution(void)
     (void)pNtSet(0, FALSE, &actual);
 }
 
-static void SyncStartupShortcut(BOOL enable)
+// Earlier versions dropped a .url in the Startup folder. That can never launch this
+// app, which requires elevation, so clean up any leftover from an older install.
+static void RemoveLegacyStartupShortcut(void)
 {
+    char startupPath[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_STARTUP, NULL, 0, startupPath) != S_OK)
+        return;
+
+    char urlPath[MAX_PATH + 32];
+    snprintf(urlPath, sizeof(urlPath), "%s\\TimerResTool.url", startupPath);
+    DeleteFileA(urlPath);
+}
+
+static BOOL RunSchTasks(const char* args)
+{
+    char sysDir[MAX_PATH];
+    if (!GetSystemDirectoryA(sysDir, sizeof(sysDir)))
+        return FALSE;
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "\"%s\\schtasks.exe\" %s", sysDir, args);
+
+    SECURITY_ATTRIBUTES sa = {0};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    // schtasks may prompt for a password on stdin; give it NUL so it fails fast
+    // instead of hanging a process that has no console.
+    HANDLE hNul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    if (hNul != INVALID_HANDLE_VALUE)
+    {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = si.hStdOutput = si.hStdError = hNul;
+    }
+
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, (hNul != INVALID_HANDLE_VALUE),
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+
+    if (ok)
+    {
+        DWORD code = 1;
+        if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &code);
+        else
+            TerminateProcess(pi.hProcess, 1);
+        ok = (code == 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+
+    if (hNul != INVALID_HANDLE_VALUE)
+        CloseHandle(hNul);
+
+    return ok;
+}
+
+// A Startup-folder entry cannot start an app that requires administrator, so the
+// autostart is a scheduled task that runs at logon with the highest privileges.
+static BOOL SyncStartupTask(BOOL enable)
+{
+    RemoveLegacyStartupShortcut();
+
+    char args[1024];
+
+    if (!enable)
+    {
+        // Deleting a task that was never created reports an error; not a failure here.
+        snprintf(args, sizeof(args), "/Delete /F /TN \"%s\"", TASK_NAME);
+        RunSchTasks(args);
+        return TRUE;
+    }
+
     char exePath[MAX_PATH];
     if (!GetModuleFileNameA(NULL, exePath, sizeof(exePath)))
-        return;
+        return FALSE;
 
-    char startupPath[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_STARTUP | CSIDL_FLAG_CREATE, NULL, 0, startupPath) != S_OK)
-        return;
-
-    char urlPath[MAX_PATH];
-    snprintf(urlPath, sizeof(urlPath), "%s\\TimerResTool.url", startupPath);
-
-    char urlContent[1024];
-    snprintf(urlContent, sizeof(urlContent),
-        "[InternetShortcut]\r\nIconFile=%s\r\nIconIndex=0\r\nURL=%s\r\n",
-        exePath, exePath);
-
-    if (enable)
+    // Bind the task to the current user with an interactive token, which keeps it
+    // elevated without storing a password.
+    char principal[300] = {0};
+    char domain[128], user[128];
+    if (GetEnvironmentVariableA("USERDOMAIN", domain, sizeof(domain)) &&
+        GetEnvironmentVariableA("USERNAME", user, sizeof(user)))
     {
-        FILE* f = fopen(urlPath, "w");
-        if (f)
-        {
-            fwrite(urlContent, 1, strlen(urlContent), f);
-            fclose(f);
-        }
+        snprintf(principal, sizeof(principal), " /RU \"%s\\%s\" /IT", domain, user);
     }
-    else
-    {
-        DeleteFileA(urlPath);
-    }
+
+    snprintf(args, sizeof(args),
+        "/Create /F /TN \"%s\" /TR \"\\\"%s\\\"\" /SC ONLOGON /RL HIGHEST%s",
+        TASK_NAME, exePath, principal);
+
+    return RunSchTasks(args);
 }
 
 static void RefreshInfo(HWND hwndDlg)
@@ -194,23 +334,31 @@ static void RefreshInfo(HWND hwndDlg)
     if (!hwndDlg) return;
 
     ULONG min, max, cur;
-    char buf[64];
+    char buf[80];
+
+    RefreshGlobalMode(hwndDlg);
 
     if (!GetTimerInfo(&min, &max, &cur))
     {
-        if (hLblCurVal) SetWindowTextA(hLblCurVal, "current: --");
+        if (hLblCurVal) SetWindowTextA(hLblCurVal, "current: --   requested: --");
         if (hLblMaxVal) SetWindowTextA(hLblMaxVal, "maximum: --");
         if (hLblMinVal) SetWindowTextA(hLblMinVal, "minimum: --");
         return;
     }
 
-    sprintf_s(buf, sizeof(buf), "current: %.3f ms", UnitsToMs(cur));
+    // "current" is what the system reports now; "requested" is what we asked for.
+    // They diverge when another process holds a finer request than ours.
+    if (gRequestedMs > 0.0)
+        sprintf_s(buf, sizeof(buf), "current: %.4f ms   requested: %.4f ms",
+                  UnitsToMs(cur), gRequestedMs);
+    else
+        sprintf_s(buf, sizeof(buf), "current: %.4f ms   requested: --", UnitsToMs(cur));
     if (hLblCurVal) SetWindowTextA(hLblCurVal, buf);
 
-    sprintf_s(buf, sizeof(buf), "maximum: %.3f ms", UnitsToMs(max));
+    sprintf_s(buf, sizeof(buf), "maximum: %.4f ms", UnitsToMs(max));
     if (hLblMaxVal) SetWindowTextA(hLblMaxVal, buf);
 
-    sprintf_s(buf, sizeof(buf), "minimum: %.3f ms", UnitsToMs(min));
+    sprintf_s(buf, sizeof(buf), "minimum: %.4f ms", UnitsToMs(min));
     if (hLblMinVal) SetWindowTextA(hLblMinVal, buf);
 }
 
@@ -248,11 +396,11 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 
         if (c >= '0' && c <= '9')
         {
-            if (len < 6) allow = TRUE;
+            if (len < 7) allow = TRUE;
         }
         else if (c == '.')
         {
-            if (len < 6 && !strstr(buf, "."))
+            if (len < 7 && !strstr(buf, "."))
                 allow = TRUE;
         }
         else if (c == 8)
@@ -297,7 +445,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             }
 
             // Default value and input filter
-            SetWindowTextA(hEditMs, "0.500");
+            SetWindowTextA(hEditMs, "0.5000");
 
             gOldEditProc = SetWindowLongPtrA(hEditMs, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
             hChkApplyStartup = GetDlgItem(hwndDlg, IDC_CHK_APPLY_STARTUP);
@@ -306,6 +454,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             hLblCurVal = GetDlgItem(hwndDlg, IDC_LBL_CURRENT_VALUE);
             hLblMaxVal = GetDlgItem(hwndDlg, IDC_LBL_MAXIMUM_VALUE);
             hLblMinVal = GetDlgItem(hwndDlg, IDC_LBL_MINIMUM_VALUE);
+            hLblGlobal = GetDlgItem(hwndDlg, IDC_LBL_GLOBAL_VALUE);
 
             // Restore checkboxes
             SendMessage(hChkApplyStartup, BM_SETCHECK,
@@ -318,8 +467,9 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             if (msVal > 0.0 && ReadBoolConfig(REG_VAL_APPLY))
             {
                 char buf[32];
-                sprintf_s(buf, sizeof(buf), "%.3f", msVal);
+                sprintf_s(buf, sizeof(buf), "%.4f", msVal);
                 SetWindowTextA(hEditMs, buf);
+                gRequestedMs  = msVal;
                 SetTimerResolutionMs(msVal);
             }
 
@@ -409,11 +559,13 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             HDC hdc = dis->hDC;
             RECT r = dis->rcItem;
 
+            BOOL disabled = (dis->itemState & ODS_DISABLED) != 0;
+
             HBRUSH bg = CreateSolidBrush(clrBtnBg);
             FillRect(hdc, &r, bg);
             DeleteObject(bg);
 
-            HPEN pen = CreatePen(PS_SOLID, 1, clrBtnBorder);
+            HPEN pen = CreatePen(PS_SOLID, 1, disabled ? clrLine : clrBtnBorder);
             HGDIOBJ oldPen = SelectObject(hdc, pen);
             HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
             Rectangle(hdc, r.left, r.top, r.right, r.bottom);
@@ -425,7 +577,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             GetWindowTextA((HWND)dis->hwndItem, txt, _countof(txt));
 
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, clrBtnText);
+            SetTextColor(hdc, disabled ? clrSignature : clrBtnText);
             DrawTextA(hdc, txt, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             return TRUE;
@@ -459,9 +611,10 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                 if (ms < 0.500) ms = 0.500;
                 if (ms > 15.625) ms = 15.625;
 
-                sprintf_s(buf, sizeof(buf), "%.3f", ms);
+                sprintf_s(buf, sizeof(buf), "%.4f", ms);
                 SetWindowTextA(hEditMs, buf);
 
+                gRequestedMs  = ms;
                 SetTimerResolutionMs(ms);
                 WriteConfigMs(ms);
                 RefreshInfo(hwndDlg);
@@ -473,8 +626,9 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                 // Max = best resolution = 0.500 ms (hardcoded lower limit)
                 double ms = 0.500;
                 char buf[32];
-                sprintf_s(buf, sizeof(buf), "%.3f", ms);
+                sprintf_s(buf, sizeof(buf), "%.4f", ms);
                 SetWindowTextA(hEditMs, buf);
+                gRequestedMs  = ms;
                 SetTimerResolutionMs(ms);
                 WriteConfigMs(ms);
                 RefreshInfo(hwndDlg);
@@ -484,20 +638,61 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             if (wId == IDC_BTN_DEFAULT)
             {
                 ReleaseTimerResolution();
+                gRequestedMs  = 0.0;
                 WriteConfigMs(0.0);
                 SetWindowTextA(hEditMs, "");
                 SendMessage(hChkApplyStartup, BM_SETCHECK, (WPARAM)BST_UNCHECKED, 0);
                 WriteBoolConfig(REG_VAL_APPLY, FALSE);
-                SyncStartupShortcut(FALSE);
+                SyncStartupTask(FALSE);
                 RefreshInfo(hwndDlg);
+                break;
+            }
+
+            if (wId == IDC_BTN_REFRESH)
+            {
+                // Manual only, on demand. No timer, no thread: the app costs
+                // nothing while it sits idle.
+                RefreshInfo(hwndDlg);
+                break;
+            }
+
+            if (wId == IDC_BTN_GLOBAL)
+            {
+                BOOL on = ReadGlobalMode();
+
+                if (SetGlobalMode(!on))
+                    MessageBoxA(hwndDlg, on
+                        ? "Global timer mode disabled.\n\n"
+                          "Restart Windows for it to take effect. Until you do,\n"
+                          "requests still apply system-wide."
+                        : "Global timer mode enabled.\n\n"
+                          "Restart Windows for it to take effect. Until you do, timer\n"
+                          "resolution requests still apply per-process only, and this\n"
+                          "app has no effect on other programs.",
+                        "Timer Resolution", MB_OK | MB_ICONINFORMATION);
+                else
+                    MessageBoxA(hwndDlg,
+                        "Could not write the setting.\n"
+                        "Run this app as administrator and try again.",
+                        "Timer Resolution", MB_OK | MB_ICONWARNING);
+
+                RefreshGlobalMode(hwndDlg);
                 break;
             }
 
             if (wId == IDC_CHK_APPLY_STARTUP)
             {
                 BOOL v = (BOOL)(SendMessage(hChkApplyStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                if (!SyncStartupTask(v))
+                {
+                    MessageBoxA(hwndDlg,
+                        "Could not register the startup task.\n"
+                        "Run this app as administrator and try again.",
+                        "Timer Resolution", MB_OK | MB_ICONWARNING);
+                    v = FALSE;
+                    SendMessage(hChkApplyStartup, BM_SETCHECK, (WPARAM)BST_UNCHECKED, 0);
+                }
                 WriteBoolConfig(REG_VAL_APPLY, v);
-                SyncStartupShortcut(v);
                 break;
             }
 
