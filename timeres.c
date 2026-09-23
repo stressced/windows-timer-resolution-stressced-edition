@@ -39,11 +39,15 @@ typedef NTSTATUS (WINAPI *NtSetTimerResolution_t)(
 #define IDM_TRAY_OPEN             400
 #define IDM_TRAY_EXIT             401
 #define WM_TRAY                   (WM_USER + 1)
+#define WM_APP_MAXIMIZE           (WM_APP + 1)
+
+#define EDIT_MAX_CHARS            7
 
 static const char REG_KEY[]       = "SOFTWARE\\TimerResTool";
 static const char REG_VAL_MS[]    = "MsValue";
 static const char REG_VAL_APPLY[] = "ApplyAtStartup";
 static const char REG_VAL_TRAY[]  = "TrayMin";
+static const char REG_VAL_PLACEMENT[] = "WindowPlacement";
 static const char TASK_NAME[]     = "TimerResTool_ApplyAtStartup";
 
 // Without this machine-wide setting, Windows 10 2004+ services each process at the
@@ -56,6 +60,7 @@ static COLORREF clrBg        = RGB(32, 32, 32);
 static COLORREF clrText      = RGB(220, 220, 220);
 static COLORREF clrBtnText   = RGB(230, 230, 230);
 static COLORREF clrBtnBg     = RGB(38, 38, 38);
+static COLORREF clrBtnPressed = RGB(62, 62, 62);
 static COLORREF clrBtnBorder = RGB(120, 120, 120);
 static COLORREF clrSignature = RGB(90, 90, 90);
 static COLORREF clrLine      = RGB(50, 50, 50);
@@ -82,6 +87,9 @@ static NtSetTimerResolution_t   pNtSet   = NULL;
 
 static NOTIFYICONDATAA nid = {0};
 static BOOL trayVisible = FALSE;
+
+// Broadcast by Explorer when the taskbar is (re)created; tray icons must be re-added.
+static UINT gMsgTaskbarCreated = 0;
 
 static double ReadConfigMs(void)
 {
@@ -132,6 +140,106 @@ static void WriteBoolConfig(const char* name, BOOL val)
     DWORD v = val ? 1 : 0;
     RegSetValueExA(hKey, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
+}
+
+// Standard window placement persistence: normal rectangle plus maximized state,
+// stored as a raw WINDOWPLACEMENT. Minimized (or hidden in the tray) is never
+// restored; the window comes back as it was before it was minimized.
+static void SaveWindowPlacement(HWND hwnd)
+{
+    WINDOWPLACEMENT wp;
+    wp.length = sizeof(wp);
+    if (!GetWindowPlacement(hwnd, &wp))
+        return;
+
+    BOOL maximized = (wp.showCmd == SW_SHOWMAXIMIZED) ||
+        (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
+    wp.showCmd = maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    wp.flags = 0;
+
+    HKEY hKey;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExA(hKey, REG_VAL_PLACEMENT, 0, REG_BINARY, (const BYTE*)&wp, sizeof(wp));
+    RegCloseKey(hKey);
+}
+
+static BOOL ReadWindowPlacement(WINDOWPLACEMENT* wp)
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    DWORD sz = sizeof(*wp), type = 0;
+    LONG r = RegQueryValueExA(hKey, REG_VAL_PLACEMENT, NULL, &type, (LPBYTE)wp, &sz);
+    RegCloseKey(hKey);
+    return (r == ERROR_SUCCESS && type == REG_BINARY &&
+            sz == sizeof(*wp) && wp->length == sizeof(*wp));
+}
+
+// First run: center on the primary monitor's work area (taskbar excluded), in
+// physical pixels, so it is centered at any resolution and scale factor.
+static void CenterOnPrimaryMonitor(HWND hwnd)
+{
+    POINT origin = {0, 0};
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi))
+        return;
+
+    // Twice: moving a per-monitor-DPI window can rescale it, which changes its size.
+    for (int pass = 0; pass < 2; pass++)
+    {
+        RECT rc;
+        GetWindowRect(hwnd, &rc);
+        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
+        int y = mi.rcWork.top  + ((mi.rcWork.bottom - mi.rcWork.top) - h) / 2;
+        if (x < mi.rcWork.left) x = mi.rcWork.left;   // larger than the screen:
+        if (y < mi.rcWork.top)  y = mi.rcWork.top;    // keep the title bar reachable
+        SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+// Called from WM_INITDIALOG, while the dialog is still hidden.
+static void RestoreWindowPlacement(HWND hwnd)
+{
+    WINDOWPLACEMENT wp;
+    if (!ReadWindowPlacement(&wp))
+    {
+        CenterOnPrimaryMonitor(hwnd);
+        return;
+    }
+
+    LONG style = GetWindowLongA(hwnd, GWL_STYLE);
+    RECT* rc = &wp.rcNormalPosition;
+
+    // A fixed-size window keeps the size its template gives it at the current DPI;
+    // only a resizable one gets its saved size back.
+    if (!(style & WS_THICKFRAME))
+    {
+        RECT cur;
+        GetWindowRect(hwnd, &cur);
+        rc->right  = rc->left + (cur.right - cur.left);
+        rc->bottom = rc->top  + (cur.bottom - cur.top);
+    }
+
+    // The monitor it was on may be gone, or the resolution lowered: start centered.
+    if (MonitorFromRect(rc, MONITOR_DEFAULTTONULL) == NULL)
+    {
+        CenterOnPrimaryMonitor(hwnd);
+        return;
+    }
+
+    BOOL maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
+
+    // Position only; DialogBox shows the window itself once WM_INITDIALOG returns.
+    wp.showCmd = SW_HIDE;
+    wp.flags = 0;
+    SetWindowPlacement(hwnd, &wp);
+
+    if (maximized && (style & WS_MAXIMIZEBOX))
+        PostMessageA(hwnd, WM_APP_MAXIMIZE, 0, 0);
 }
 
 static BOOL ReadGlobalMode(void)
@@ -384,28 +492,92 @@ static void RemoveTrayIcon(void)
     trayVisible = FALSE;
 }
 
+// Would replacing the current selection with `ins` still leave a valid entry
+// (digits and at most one dot, EDIT_MAX_CHARS long at most)?
+static BOOL EditAcceptsInsert(HWND hwnd, const char* ins)
+{
+    char buf[64];
+    GetWindowTextA(hwnd, buf, sizeof(buf));
+    DWORD len = (DWORD)strlen(buf);
+
+    DWORD selStart = 0, selEnd = 0;
+    SendMessageA(hwnd, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+    if (selEnd > len) selEnd = len;
+    if (selStart > selEnd) selStart = selEnd;
+
+    DWORD insLen = (DWORD)strlen(ins);
+    if (insLen == 0 || selStart + insLen + (len - selEnd) > EDIT_MAX_CHARS)
+        return FALSE;
+
+    char result[64];
+    memcpy(result, buf, selStart);
+    memcpy(result + selStart, ins, insLen);
+    memcpy(result + selStart + insLen, buf + selEnd, len - selEnd + 1);
+
+    int dots = 0;
+    for (const char* p = result; *p; p++)
+    {
+        if (*p == '.') dots++;
+        else if (*p < '0' || *p > '9') return FALSE;
+    }
+    return dots <= 1;
+}
+
+static void EditFilteredPaste(HWND hwnd)
+{
+    char text[64] = {0};
+    if (OpenClipboard(hwnd))
+    {
+        HANDLE h = GetClipboardData(CF_TEXT);
+        const char* src = h ? (const char*)GlobalLock(h) : NULL;
+        if (src)
+        {
+            strncpy_s(text, sizeof(text), src, _TRUNCATE);
+            GlobalUnlock(h);
+        }
+        CloseClipboard();
+    }
+
+    // Tolerate surrounding whitespace, e.g. a value copied from a text file.
+    char* s = text;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    char* e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+
+    if (EditAcceptsInsert(hwnd, s))
+        SendMessageA(hwnd, EM_REPLACESEL, TRUE, (LPARAM)s);
+    else
+        MessageBeep(MB_OK);
+}
+
 static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     if (uMsg == WM_CHAR)
     {
         char c = (char)wParam;
-        char buf[64];
-        GetWindowTextA(hwnd, buf, sizeof(buf));
-        int len = (int)strlen(buf);
         BOOL allow = FALSE;
 
-        if (c >= '0' && c <= '9')
+        if ((c >= '0' && c <= '9') || c == '.')
         {
-            if (len < 7) allow = TRUE;
+            char ins[2] = { c, 0 };
+            allow = EditAcceptsInsert(hwnd, ins);
         }
-        else if (c == '.')
+        else if (c == 8 || c == 3 || c == 22 || c == 24 || c == 26)
         {
-            if (len < 7 && !strstr(buf, "."))
-                allow = TRUE;
-        }
-        else if (c == 8)
-        {
+            // Backspace, Ctrl+C, Ctrl+V (arrives as the filtered WM_PASTE below),
+            // Ctrl+X, Ctrl+Z
             allow = TRUE;
+        }
+        else if (c == 1)
+        {
+            SendMessageA(hwnd, EM_SETSEL, 0, -1);   // Ctrl+A
+        }
+        else if (c == '\r')
+        {
+            // The multiline edit swallows Enter, so the dialog never sees it.
+            HWND dlg = GetParent(hwnd);
+            SendMessageA(dlg, WM_COMMAND, MAKEWPARAM(IDC_BTN_SET, BN_CLICKED),
+                         (LPARAM)GetDlgItem(dlg, IDC_BTN_SET));
         }
 
         if (allow)
@@ -414,7 +586,21 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
         return 0;
     }
 
+    if (uMsg == WM_PASTE)
+    {
+        EditFilteredPaste(hwnd);
+        return 0;
+    }
+
     return CallWindowProcA((WNDPROC)gOldEditProc, hwnd, uMsg, wParam, lParam);
+}
+
+static void ShowMainWindow(HWND hwnd)
+{
+    // Hidden in the tray the window is still minimized; SW_SHOW alone would
+    // bring it back as a taskbar button instead of on screen.
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(hwnd);
 }
 
 static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -462,19 +648,28 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             SendMessage(hChkTray, BM_SETCHECK,
                 (WPARAM)(ReadBoolConfig(REG_VAL_TRAY) ? BST_CHECKED : BST_UNCHECKED), 0);
 
-            // Startup apply
+            // Show the last saved value either way; only apply it if asked to.
             double msVal = ReadConfigMs();
-            if (msVal > 0.0 && ReadBoolConfig(REG_VAL_APPLY))
+            if (msVal > 0.0)
             {
                 char buf[32];
                 sprintf_s(buf, sizeof(buf), "%.4f", msVal);
                 SetWindowTextA(hEditMs, buf);
-                gRequestedMs  = msVal;
-                SetTimerResolutionMs(msVal);
+                if (ReadBoolConfig(REG_VAL_APPLY))
+                {
+                    gRequestedMs  = msVal;
+                    SetTimerResolutionMs(msVal);
+                }
             }
+
+            // Explorer runs at medium integrity; let its TaskbarCreated broadcast
+            // through to this elevated window so the tray icon survives a restart.
+            if (gMsgTaskbarCreated)
+                ChangeWindowMessageFilterEx(hwndDlg, gMsgTaskbarCreated, MSGFLT_ALLOW, NULL);
 
             EnsureTray(hwndDlg);
             RefreshInfo(hwndDlg);
+            RestoreWindowPlacement(hwndDlg);
 
             return TRUE;
         }
@@ -496,8 +691,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 
                 if (cmd == IDM_TRAY_OPEN)
                 {
-                    ShowWindow(hwndDlg, SW_SHOW);
-                    SetForegroundWindow(hwndDlg);
+                    ShowMainWindow(hwndDlg);
                 }
                 else if (cmd == IDM_TRAY_EXIT)
                 {
@@ -506,10 +700,15 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             }
             else if (LOWORD(lParam) == WM_LBUTTONUP)
             {
-                ShowWindow(hwndDlg, SW_SHOW);
-                SetForegroundWindow(hwndDlg);
+                ShowMainWindow(hwndDlg);
             }
             break;
+        }
+
+        case WM_APP_MAXIMIZE:
+        {
+            ShowWindow(hwndDlg, SW_MAXIMIZE);
+            return TRUE;
         }
 
         case WM_CTLCOLORDLG:
@@ -561,7 +760,9 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 
             BOOL disabled = (dis->itemState & ODS_DISABLED) != 0;
 
-            HBRUSH bg = CreateSolidBrush(clrBtnBg);
+            BOOL pressed = (dis->itemState & ODS_SELECTED) != 0;
+
+            HBRUSH bg = CreateSolidBrush(pressed ? clrBtnPressed : clrBtnBg);
             FillRect(hdc, &r, bg);
             DeleteObject(bg);
 
@@ -606,6 +807,16 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             {
                 char buf[64];
                 GetWindowTextA(hEditMs, buf, sizeof(buf));
+
+                // Empty (e.g. right after Default) or just "." is not a request;
+                // don't silently turn it into 0.5000.
+                if (strspn(buf, ".") == strlen(buf))
+                {
+                    MessageBeep(MB_OK);
+                    SetFocus(hEditMs);
+                    break;
+                }
+
                 double ms = atof(buf);
 
                 if (ms < 0.500) ms = 0.500;
@@ -708,9 +919,18 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 
         case WM_CLOSE:
         {
+            SaveWindowPlacement(hwndDlg);
             RemoveTrayIcon();
             EndDialog(hwndDlg, 0);
             return TRUE;
+        }
+
+        case WM_ENDSESSION:
+        {
+            // Logoff/shutdown ends the process without a WM_CLOSE.
+            if (wParam)
+                SaveWindowPlacement(hwndDlg);
+            return 0;
         }
 
         case WM_NCDESTROY:
@@ -720,6 +940,11 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
         }
 
         default:
+            if (gMsgTaskbarCreated && uMsg == gMsgTaskbarCreated)
+            {
+                trayVisible = FALSE;   // the old icon died with the old taskbar
+                EnsureTray(hwndDlg);
+            }
             return 0;
     }
     return 0;
@@ -746,6 +971,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LoadNtFunctions();
+    gMsgTaskbarCreated = RegisterWindowMessageA("TaskbarCreated");
 
     hBgBrush = CreateSolidBrush(clrBg);
     DialogBoxParamA(hInstance, MAKEINTRESOURCEA(1), NULL, MainDlgProc, 0);
