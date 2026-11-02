@@ -1,9 +1,12 @@
-# Windows Timer Resolution – Stressced Edition
+# ResTimer
 
-A small, native Windows tool that raises the system timer resolution (for example
+*by Stressced Software*
+
+ResTimer is a small, native Windows tool that sets the timer resolution you choose.
+It doesn't search for the best value for you. It raises the system timer resolution (for example
 from the stock 15.625 ms down to 0.5 ms), with an honest view of what Windows is
-actually doing. It's a single ~180 KB executable with no installer, no runtime and
-no background threads.
+actually doing. It's a single ~220 KB portable executable with no installer, no runtime and
+no background threads: copy `ResTimer.exe` to any Windows 10/11 PC and run it.
 
 The app has a dark UI and a tray icon. It remembers its settings and restores its
 window position between runs.
@@ -36,7 +39,7 @@ window position between runs.
 
 ## Usage
 
-1. Run `timeres.exe` and accept the UAC prompt.
+1. Run `ResTimer.exe` and accept the UAC prompt.
 2. Check the **global mode** line. On Windows 10 2004 or later, if it says
    `OFF (per-process)`, click **Enable global** and **restart Windows**. Without
    this step the timer only changes inside this app's own process and has no
@@ -78,9 +81,13 @@ These are easy to get wrong, and most timer-resolution tools don't mention them.
 
 | What | Where |
 |------|-------|
-| App settings (value, checkboxes, window position) | `HKCU\SOFTWARE\TimerResTool` |
+| App settings (value, checkboxes, window position) | `HKCU\SOFTWARE\ResTimer` |
 | Global mode | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel`, value `GlobalTimerResolutionRequests` |
-| Autostart | Scheduled task `TimerResTool_ApplyAtStartup` |
+| Autostart | Scheduled task `ResTimer_ApplyAtStartup` |
+
+Before it was renamed to ResTimer, the app used `HKCU\SOFTWARE\TimerResTool` and the
+task `TimerResTool_ApplyAtStartup`. The first launch of ResTimer moves those
+settings to the new key and replaces the old task.
 
 ### Uninstalling
 
@@ -88,7 +95,7 @@ These are easy to get wrong, and most timer-resolution tools don't mention them.
    the scheduled task.
 2. If you enabled global mode and want the stock Windows behavior back, click
    **Disable global** and reboot.
-3. Delete `timeres.exe`. Optionally, delete the `HKCU\SOFTWARE\TimerResTool` key.
+3. Delete `ResTimer.exe`. Optionally, delete the `HKCU\SOFTWARE\ResTimer` key.
 
 ## Building from source
 
@@ -96,7 +103,7 @@ This project uses [MSYS2](https://www.msys2.org/) (UCRT64) with the MinGW-w64
 toolchain. From an MSYS2 UCRT64 shell in the project folder, run:
 
 ```sh
-x86_64-w64-mingw32-gcc -mwindows -O2 -Wall -o timeres.exe timeres.c timeres.rc \
+x86_64-w64-mingw32-gcc -mwindows -O2 -Wall -static -o ResTimer.exe restimer.c restimer.rc \
     -lkernel32 -luser32 -lgdi32 -lshell32
 ```
 
@@ -104,8 +111,9 @@ The build is expected to produce no warnings under `-Wall`.
 
 | File | Purpose |
 |------|---------|
-| `timeres.c` | The whole application |
-| `timeres.rc` | Dialog layout and version info |
+| `restimer.c` | The whole application |
+| `restimer.rc` | Dialog layout, icons and version info |
+| `gen_icon.ps1` | Builds `restimer.ico` (from `R.png`) and the Patreon / X link icons in `icons\` |
 | `app.manifest` | Requests administrator rights and per-monitor DPI awareness |
 
 ## License
@@ -114,4 +122,4 @@ Public domain.
 
 ---
 
-By **Stressced**.
+By **Stressced Software** · [Patreon](https://www.patreon.com/cw/Stressced) · [X](https://x.com/Stressced)

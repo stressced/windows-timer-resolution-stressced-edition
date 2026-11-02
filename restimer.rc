@@ -1,5 +1,10 @@
-﻿#include <windows.h>
+#include <windows.h>
 
+#define IDI_APP                   1
+#define IDI_PATREON               2
+#define IDI_PATREON_HOVER         3
+#define IDI_X                     4
+#define IDI_X_HOVER               5
 #define IDC_EDIT_MS               1001
 #define IDC_BTN_SET               1002
 #define IDC_BTN_MAX               1003
@@ -16,10 +21,22 @@
 #define IDC_LBL_GLOBAL_VALUE      1019
 #define IDC_LINE1                 1020
 #define IDC_LINE2                 1021
+#define IDC_BTN_PATREON           1030
+#define IDC_BTN_X                 1031
+
+// First icon group in the file = the icon Explorer shows for ResTimer.exe.
+// Generated from R.png by gen_icon.ps1.
+IDI_APP ICON "restimer.ico"
+
+// Link buttons next to the signature, also from gen_icon.ps1 (rest / hover colour).
+IDI_PATREON       ICON "icons/patreon.ico"
+IDI_PATREON_HOVER ICON "icons/patreon_hover.ico"
+IDI_X             ICON "icons/x.ico"
+IDI_X_HOVER       ICON "icons/x_hover.ico"
 
 1 DIALOGEX 0,0,260,160
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
-CAPTION "New Timer Resolution"
+CAPTION "ResTimer"
 FONT 9, "Segoe UI"
 {
     EDITTEXT IDC_EDIT_MS,        10, 11, 115, 20, ES_MULTILINE | ES_AUTOHSCROLL | ES_CENTER | WS_TABSTOP
@@ -44,7 +61,11 @@ FONT 9, "Segoe UI"
 
     PUSHBUTTON "Enable global",  IDC_BTN_GLOBAL,   135, 116, 115, 20, WS_TABSTOP | BS_OWNERDRAW
 
-    LTEXT "Stressced", IDC_LBL_SIGNATURE, 195, 140, 55, 10, SS_RIGHT
+    // The two link buttons are moved at runtime to sit just left of the
+    // right-aligned signature text (LayoutSignature), whatever its width.
+    PUSHBUTTON "Patreon",        IDC_BTN_PATREON,  150, 138, 12, 12, WS_TABSTOP | BS_OWNERDRAW
+    PUSHBUTTON "X",              IDC_BTN_X,        163, 138, 12, 12, WS_TABSTOP | BS_OWNERDRAW
+    LTEXT "Stressced Software", IDC_LBL_SIGNATURE, 160, 140, 90, 10, SS_RIGHT | SS_NOPREFIX
 }
 
 1 VERSIONINFO
@@ -55,13 +76,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "TimerResTool"
-            VALUE "FileDescription",  "Windows Timer Resolution Tool"
+            VALUE "CompanyName",      "Stressced Software"
+            VALUE "FileDescription",  "ResTimer - Windows timer resolution"
             VALUE "FileVersion",      "1.0.0.0"
-            VALUE "InternalName",     "timeres.exe"
+            VALUE "InternalName",     "ResTimer"
             VALUE "LegalCopyright",   "Public Domain"
-            VALUE "OriginalFilename", "timeres.exe"
-            VALUE "ProductName",      "Timer Resolution"
+            VALUE "OriginalFilename", "ResTimer.exe"
+            VALUE "ProductName",      "ResTimer"
             VALUE "ProductVersion",   "1.0.0.0"
         END
     END

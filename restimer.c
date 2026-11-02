@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include <shlobj.h>
@@ -17,6 +17,11 @@ typedef NTSTATUS (WINAPI *NtSetTimerResolution_t)(
     PULONG ActualResolution
 );
 
+#define IDI_APP                   1
+#define IDI_PATREON               2
+#define IDI_PATREON_HOVER         3
+#define IDI_X                     4
+#define IDI_X_HOVER               5
 #define IDC_EDIT_MS               1001
 #define IDC_BTN_SET               1002
 #define IDC_BTN_MAX               1003
@@ -35,20 +40,35 @@ typedef NTSTATUS (WINAPI *NtSetTimerResolution_t)(
 
 #define IDC_LINE1                 1020
 #define IDC_LINE2                 1021
+#define IDC_BTN_PATREON           1030
+#define IDC_BTN_X                 1031
 
 #define IDM_TRAY_OPEN             400
 #define IDM_TRAY_EXIT             401
 #define WM_TRAY                   (WM_USER + 1)
 #define WM_APP_MAXIMIZE           (WM_APP + 1)
+#define WM_APP_LAYOUT             (WM_APP + 2)
+
+static const char URL_PATREON[] = "https://www.patreon.com/cw/Stressced";
+static const char URL_X[]       = "https://x.com/Stressced";
 
 #define EDIT_MAX_CHARS            7
 
-static const char REG_KEY[]       = "SOFTWARE\\TimerResTool";
+// Display name: window caption (must match CAPTION in restimer.rc, FindWindow uses
+// it for the single instance), tray tip and message boxes.
+#define APP_NAME "ResTimer"
+
+static const char REG_KEY[]       = "SOFTWARE\\ResTimer";
 static const char REG_VAL_MS[]    = "MsValue";
+static const char REG_VAL_INPUT[] = "LastInput";
 static const char REG_VAL_APPLY[] = "ApplyAtStartup";
 static const char REG_VAL_TRAY[]  = "TrayMin";
 static const char REG_VAL_PLACEMENT[] = "WindowPlacement";
-static const char TASK_NAME[]     = "TimerResTool_ApplyAtStartup";
+static const char TASK_NAME[]     = "ResTimer_ApplyAtStartup";
+
+// Names used before the app became ResTimer; MigrateLegacyConfig moves them over.
+static const char LEGACY_REG_KEY[]   = "SOFTWARE\\TimerResTool";
+static const char LEGACY_TASK_NAME[] = "TimerResTool_ApplyAtStartup";
 
 // Without this machine-wide setting, Windows 10 2004+ services each process at the
 // resolution that process itself requested, so anything we set here affects nothing
@@ -65,6 +85,14 @@ static COLORREF clrBtnBorder = RGB(120, 120, 120);
 static COLORREF clrSignature = RGB(90, 90, 90);
 static COLORREF clrLine      = RGB(50, 50, 50);
 
+// Signature and link buttons, after Silicon Tuner's header: muted publisher text,
+// --text-secondary icons that turn --accent on hover over a raised square, and a
+// --series-1 ring for keyboard focus. The icon colours are baked into icons\*.ico.
+static COLORREF clrPublisher = RGB(164, 164, 164);
+static COLORREF clrLinkHover = RGB(42, 42, 42);
+static COLORREF clrLinkEdge  = RGB(60, 60, 60);
+static COLORREF clrFocusRing = RGB(64, 185, 200);
+
 static HBRUSH hBgBrush = NULL;
 static HBRUSH hLineBrush = NULL;
 
@@ -78,6 +106,11 @@ static HWND hLblMaxVal = NULL;
 static HWND hLblMinVal = NULL;
 static HWND hLblGlobal = NULL;
 static LONG_PTR gOldEditProc = 0;
+static LONG_PTR gOldLinkProc = 0;   // same BUTTON class proc for both link buttons
+
+// Link icons at the size last drawn: [0] Patreon, [1] X; [i][1] is the hover colour.
+static HICON gLinkIcon[2][2];
+static int   gLinkIconSize = 0;
 
 // Last value we asked for. 0 means we hold no request.
 static double gRequestedMs = 0.0;
@@ -115,6 +148,52 @@ static void WriteConfigMs(double ms)
     char buf[32];
     sprintf_s(buf, sizeof(buf), "%.4f", ms);
     RegSetValueExA(hKey, REG_VAL_MS, 0, REG_SZ, (const BYTE*)buf, (DWORD)(strlen(buf)+1));
+    RegCloseKey(hKey);
+}
+
+// Same rule as the edit filter: digits and at most one dot, EDIT_MAX_CHARS long at most.
+static BOOL IsValidMsText(const char* s)
+{
+    if (strlen(s) > EDIT_MAX_CHARS) return FALSE;
+    int dots = 0;
+    for (; *s; s++)
+    {
+        if (*s == '.') dots++;
+        else if (*s < '0' || *s > '9') return FALSE;
+    }
+    return dots <= 1;
+}
+
+// LastInput is the text left in the edit box, applied or not, so the next launch
+// shows what was typed last. MsValue stays what was last applied (Set / Max), which
+// is what "Apply at startup" uses; Default clears MsValue but not LastInput.
+static BOOL ReadLastInput(char* out, DWORD outSize)
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    char buf[32] = {0};
+    DWORD sz = sizeof(buf);
+    BOOL ok = (RegGetValueA(hKey, NULL, REG_VAL_INPUT, RRF_RT_REG_SZ, NULL, buf, &sz) == ERROR_SUCCESS)
+              && buf[0] && IsValidMsText(buf);
+    RegCloseKey(hKey);
+    if (ok) strncpy_s(out, outSize, buf, _TRUNCATE);
+    return ok;
+}
+
+static void SaveLastInput(void)
+{
+    if (!hEditMs) return;
+    char buf[32];
+    GetWindowTextA(hEditMs, buf, sizeof(buf));
+    // An empty box (or a lone ".") keeps the previous value instead of wiping it.
+    if (strspn(buf, ".") == strlen(buf) || !IsValidMsText(buf)) return;
+
+    HKEY hKey;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExA(hKey, REG_VAL_INPUT, 0, REG_SZ, (const BYTE*)buf, (DWORD)(strlen(buf)+1));
     RegCloseKey(hKey);
 }
 
@@ -437,6 +516,44 @@ static BOOL SyncStartupTask(BOOL enable)
     return RunSchTasks(args);
 }
 
+// One-time move from the pre-ResTimer names: copy HKCU\SOFTWARE\TimerResTool to
+// HKCU\SOFTWARE\ResTimer, delete the old key, and replace the old startup task
+// (which also points at the old timeres.exe path) with one under the new name.
+// Does nothing once the new key exists or when there was never an old one.
+static void MigrateLegacyConfig(void)
+{
+    HKEY hNew, hOld;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hNew) == ERROR_SUCCESS)
+    {
+        RegCloseKey(hNew);
+        return;
+    }
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, LEGACY_REG_KEY, 0, KEY_READ, &hOld) != ERROR_SUCCESS)
+        return;
+
+    BOOL copied = FALSE;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, NULL, REG_OPTION_NON_VOLATILE,
+                        KEY_ALL_ACCESS, NULL, &hNew, NULL) == ERROR_SUCCESS)
+    {
+        copied = (RegCopyTreeA(hOld, NULL, hNew) == ERROR_SUCCESS);
+        RegCloseKey(hNew);
+    }
+    RegCloseKey(hOld);
+    if (!copied)
+    {
+        // Leave the old key alone and retry on the next launch.
+        RegDeleteTreeA(HKEY_CURRENT_USER, REG_KEY);
+        return;
+    }
+    RegDeleteTreeA(HKEY_CURRENT_USER, LEGACY_REG_KEY);
+
+    char args[256];
+    snprintf(args, sizeof(args), "/Delete /F /TN \"%s\"", LEGACY_TASK_NAME);
+    RunSchTasks(args);   // fails harmlessly when there was no task
+    if (ReadBoolConfig(REG_VAL_APPLY) && !SyncStartupTask(TRUE))
+        WriteBoolConfig(REG_VAL_APPLY, FALSE);   // keep the checkbox honest
+}
+
 static void RefreshInfo(HWND hwndDlg)
 {
     if (!hwndDlg) return;
@@ -471,6 +588,15 @@ static void RefreshInfo(HWND hwndDlg)
 }
 
 
+// The app icon (resource IDI_APP, built from R.png by gen_icon.ps1) at the size the
+// system uses for the given metric. Shared icon: loaded once, never destroyed.
+static HICON LoadAppIcon(int cxMetric, int cyMetric)
+{
+    HICON h = (HICON)LoadImageA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
+                                GetSystemMetrics(cxMetric), GetSystemMetrics(cyMetric), LR_SHARED);
+    return h ? h : LoadIcon(NULL, IDI_APPLICATION);
+}
+
 static void EnsureTray(HWND hwndDlg)
 {
     if (trayVisible) return;
@@ -479,8 +605,8 @@ static void EnsureTray(HWND hwndDlg)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    strncpy_s(nid.szTip, sizeof(nid.szTip), "Timer Resolution", _TRUNCATE);
+    nid.hIcon = LoadAppIcon(SM_CXSMICON, SM_CYSMICON);
+    strncpy_s(nid.szTip, sizeof(nid.szTip), APP_NAME, _TRUNCATE);
     Shell_NotifyIconA(NIM_ADD, &nid);
     trayVisible = TRUE;
 }
@@ -603,6 +729,142 @@ static void ShowMainWindow(HWND hwnd)
     SetForegroundWindow(hwnd);
 }
 
+// This process is elevated, and ShellExecute on the URL itself would start the
+// browser elevated too. Handing the URL to explorer.exe lets the already running
+// (non-elevated) shell open it in the default browser instead.
+static void OpenUrlUnelevated(const char* url)
+{
+    char explorer[MAX_PATH];
+    UINT n = GetWindowsDirectoryA(explorer, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH - 16) return;
+    strcat_s(explorer, sizeof(explorer), "\\explorer.exe");
+    ShellExecuteA(NULL, "open", explorer, url, NULL, SW_SHOWNORMAL);
+}
+
+static void FreeLinkIcons(void)
+{
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            if (gLinkIcon[i][j]) { DestroyIcon(gLinkIcon[i][j]); gLinkIcon[i][j] = NULL; }
+    gLinkIconSize = 0;
+}
+
+// Not LR_SHARED: that would hand back the first size loaded for every later size.
+static HICON GetLinkIcon(int idx, int hover, int size)
+{
+    if (size != gLinkIconSize)
+    {
+        FreeLinkIcons();
+        gLinkIconSize = size;
+    }
+    if (!gLinkIcon[idx][hover])
+        gLinkIcon[idx][hover] = (HICON)LoadImageA(GetModuleHandleA(NULL),
+            MAKEINTRESOURCEA(IDI_PATREON + idx * 2 + hover), IMAGE_ICON, size, size, 0);
+    return gLinkIcon[idx][hover];
+}
+
+static BOOL IsLinkButton(int id)
+{
+    return id == IDC_BTN_PATREON || id == IDC_BTN_X;
+}
+
+static void DrawLinkButton(const DRAWITEMSTRUCT* dis)
+{
+    HDC hdc = dis->hDC;
+    RECT r = dis->rcItem;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    BOOL hover = GetWindowLongPtrA(dis->hwndItem, GWLP_USERDATA) != 0 ||
+                 (dis->itemState & ODS_SELECTED);
+    BOOL focus = (dis->itemState & ODS_FOCUS) && !(dis->itemState & ODS_NOFOCUSRECT);
+
+    FillRect(hdc, &r, hBgBrush);
+    if (hover || focus)
+    {
+        HBRUSH fill = CreateSolidBrush(hover ? clrLinkHover : clrBg);
+        HPEN pen = CreatePen(PS_SOLID, 1, focus ? clrFocusRing : clrLinkEdge);
+        HGDIOBJ oldBrush = SelectObject(hdc, fill);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        int round = (w < h ? w : h) / 3;
+        RoundRect(hdc, r.left, r.top, r.right, r.bottom, round, round);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(fill);
+    }
+
+    // Silicon Tuner: 18 px icon in a 32 x 34 button, so a bit over half the side.
+    int size = (w < h ? w : h) * 9 / 16;
+    if (size < 8) size = 8;
+    HICON icon = GetLinkIcon(dis->CtlID == IDC_BTN_X ? 1 : 0, hover ? 1 : 0, size);
+    if (icon)
+        DrawIconEx(hdc, r.left + (w - size) / 2, r.top + (h - size) / 2, icon,
+                   size, size, 0, NULL, DI_NORMAL);
+}
+
+// Hover state (GWLP_USERDATA) and the hand cursor for the owner-drawn link buttons.
+static LRESULT CALLBACK LinkSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg)
+    {
+        case WM_MOUSEMOVE:
+            if (!GetWindowLongPtrA(hwnd, GWLP_USERDATA))
+            {
+                SetWindowLongPtrA(hwnd, GWLP_USERDATA, 1);
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+                TrackMouseEvent(&tme);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursor(NULL, IDC_HAND));
+            return TRUE;
+    }
+    return CallWindowProcA((WNDPROC)gOldLinkProc, hwnd, uMsg, wParam, lParam);
+}
+
+// Shrinks the right-aligned signature label to its text and puts the two link
+// buttons just left of it, vertically centred on it. Run again after a DPI change,
+// since the text width does not scale exactly with the dialog.
+static void LayoutSignature(HWND hwndDlg)
+{
+    HWND lbl = GetDlgItem(hwndDlg, IDC_LBL_SIGNATURE);
+    HWND btnP = GetDlgItem(hwndDlg, IDC_BTN_PATREON);
+    HWND btnX = GetDlgItem(hwndDlg, IDC_BTN_X);
+    if (!lbl || !btnP || !btnX) return;
+
+    char text[64];
+    GetWindowTextA(lbl, text, sizeof(text));
+    HDC hdc = GetDC(lbl);
+    HGDIOBJ oldFont = SelectObject(hdc, (HFONT)SendMessageA(lbl, WM_GETFONT, 0, 0));
+    SIZE ext = {0, 0};
+    GetTextExtentPoint32A(hdc, text, (int)strlen(text), &ext);
+    SelectObject(hdc, oldFont);
+    ReleaseDC(lbl, hdc);
+
+    RECT rl, rb;
+    GetWindowRect(lbl, &rl);
+    MapWindowPoints(NULL, hwndDlg, (POINT*)&rl, 2);
+    GetWindowRect(btnX, &rb);
+    int bw = rb.right - rb.left, bh = rb.bottom - rb.top;
+
+    RECT gap = {0, 0, 3, 1};          // 3 DLU before the text, 1 DLU between buttons
+    MapDialogRect(hwndDlg, &gap);
+
+    int textLeft = rl.right - ext.cx - 2;
+    SetWindowPos(lbl, NULL, textLeft, rl.top, rl.right - textLeft, rl.bottom - rl.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+
+    int y = (rl.top + rl.bottom) / 2 - bh / 2;
+    int xX = textLeft - gap.right - bw;
+    SetWindowPos(btnX, NULL, xX, y, bw, bh, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(btnP, NULL, xX - gap.bottom - bw, y, bw, bh, SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(hwndDlg, NULL, TRUE);
+}
+
 static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
@@ -610,6 +872,10 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
         case WM_INITDIALOG:
         {
             hMainDlg = hwndDlg;
+
+            // Title bar / Alt+Tab / taskbar icon; dialogs get none by default.
+            SendMessageA(hwndDlg, WM_SETICON, ICON_SMALL, (LPARAM)LoadAppIcon(SM_CXSMICON, SM_CYSMICON));
+            SendMessageA(hwndDlg, WM_SETICON, ICON_BIG, (LPARAM)LoadAppIcon(SM_CXICON, SM_CYICON));
 
             hEditMs = GetDlgItem(hwndDlg, IDC_EDIT_MS);
 
@@ -642,19 +908,31 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             hLblMinVal = GetDlgItem(hwndDlg, IDC_LBL_MINIMUM_VALUE);
             hLblGlobal = GetDlgItem(hwndDlg, IDC_LBL_GLOBAL_VALUE);
 
+            gOldLinkProc = SetWindowLongPtrA(GetDlgItem(hwndDlg, IDC_BTN_PATREON),
+                                             GWLP_WNDPROC, (LONG_PTR)LinkSubclassProc);
+            SetWindowLongPtrA(GetDlgItem(hwndDlg, IDC_BTN_X), GWLP_WNDPROC, (LONG_PTR)LinkSubclassProc);
+            LayoutSignature(hwndDlg);
+
             // Restore checkboxes
             SendMessage(hChkApplyStartup, BM_SETCHECK,
                 (WPARAM)(ReadBoolConfig(REG_VAL_APPLY) ? BST_CHECKED : BST_UNCHECKED), 0);
             SendMessage(hChkTray, BM_SETCHECK,
                 (WPARAM)(ReadBoolConfig(REG_VAL_TRAY) ? BST_CHECKED : BST_UNCHECKED), 0);
 
-            // Show the last saved value either way; only apply it if asked to.
+            // The box shows what was typed last (LastInput), else the last applied
+            // value, else the 0.5000 default set above. Only MsValue is ever applied.
             double msVal = ReadConfigMs();
-            if (msVal > 0.0)
+            char lastInput[32];
+            if (ReadLastInput(lastInput, sizeof(lastInput)))
+                SetWindowTextA(hEditMs, lastInput);
+            else if (msVal > 0.0)
             {
                 char buf[32];
                 sprintf_s(buf, sizeof(buf), "%.4f", msVal);
                 SetWindowTextA(hEditMs, buf);
+            }
+            if (msVal > 0.0)
+            {
                 if (ReadBoolConfig(REG_VAL_APPLY))
                 {
                     gRequestedMs  = msVal;
@@ -711,6 +989,19 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
             return TRUE;
         }
 
+        case WM_DPICHANGED:
+        {
+            // The dialog manager rescales controls and fonts after we return.
+            PostMessageA(hwndDlg, WM_APP_LAYOUT, 0, 0);
+            return FALSE;
+        }
+
+        case WM_APP_LAYOUT:
+        {
+            LayoutSignature(hwndDlg);
+            return TRUE;
+        }
+
         case WM_CTLCOLORDLG:
         case WM_CTLCOLORSTATIC:
         {
@@ -730,10 +1021,10 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                 return (LRESULT)hLineBrush;
             }
 
-            // Signature subtle color
+            // Signature: muted, like Silicon Tuner's "Stressced Software"
             if (id == IDC_LBL_SIGNATURE)
             {
-                SetTextColor(hdc, clrSignature);
+                SetTextColor(hdc, clrPublisher);
                 return (LRESULT)hBgBrush;
             }
 
@@ -754,6 +1045,12 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
         {
             LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
             if (!dis || dis->CtlType != ODT_BUTTON) return 0;
+
+            if (IsLinkButton((int)dis->CtlID))
+            {
+                DrawLinkButton(dis);
+                return TRUE;
+            }
 
             HDC hdc = dis->hDC;
             RECT r = dis->rcItem;
@@ -828,6 +1125,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                 gRequestedMs  = ms;
                 SetTimerResolutionMs(ms);
                 WriteConfigMs(ms);
+                SaveLastInput();
                 RefreshInfo(hwndDlg);
                 break;
             }
@@ -842,16 +1140,18 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                 gRequestedMs  = ms;
                 SetTimerResolutionMs(ms);
                 WriteConfigMs(ms);
+                SaveLastInput();
                 RefreshInfo(hwndDlg);
                 break;
             }
 
             if (wId == IDC_BTN_DEFAULT)
             {
+                // Releases the request but leaves the typed value in the box (and in
+                // LastInput), so Default -> Set is a quick A/B of the same value.
                 ReleaseTimerResolution();
                 gRequestedMs  = 0.0;
                 WriteConfigMs(0.0);
-                SetWindowTextA(hEditMs, "");
                 SendMessage(hChkApplyStartup, BM_SETCHECK, (WPARAM)BST_UNCHECKED, 0);
                 WriteBoolConfig(REG_VAL_APPLY, FALSE);
                 SyncStartupTask(FALSE);
@@ -880,12 +1180,12 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                           "Restart Windows for it to take effect. Until you do, timer\n"
                           "resolution requests still apply per-process only, and this\n"
                           "app has no effect on other programs.",
-                        "Timer Resolution", MB_OK | MB_ICONINFORMATION);
+                        APP_NAME, MB_OK | MB_ICONINFORMATION);
                 else
                     MessageBoxA(hwndDlg,
                         "Could not write the setting.\n"
                         "Run this app as administrator and try again.",
-                        "Timer Resolution", MB_OK | MB_ICONWARNING);
+                        APP_NAME, MB_OK | MB_ICONWARNING);
 
                 RefreshGlobalMode(hwndDlg);
                 break;
@@ -899,11 +1199,17 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
                     MessageBoxA(hwndDlg,
                         "Could not register the startup task.\n"
                         "Run this app as administrator and try again.",
-                        "Timer Resolution", MB_OK | MB_ICONWARNING);
+                        APP_NAME, MB_OK | MB_ICONWARNING);
                     v = FALSE;
                     SendMessage(hChkApplyStartup, BM_SETCHECK, (WPARAM)BST_UNCHECKED, 0);
                 }
                 WriteBoolConfig(REG_VAL_APPLY, v);
+                break;
+            }
+
+            if (wId == IDC_BTN_PATREON || wId == IDC_BTN_X)
+            {
+                OpenUrlUnelevated(wId == IDC_BTN_X ? URL_X : URL_PATREON);
                 break;
             }
 
@@ -920,6 +1226,7 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
         case WM_CLOSE:
         {
             SaveWindowPlacement(hwndDlg);
+            SaveLastInput();
             RemoveTrayIcon();
             EndDialog(hwndDlg, 0);
             return TRUE;
@@ -929,13 +1236,17 @@ static LRESULT CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
         {
             // Logoff/shutdown ends the process without a WM_CLOSE.
             if (wParam)
+            {
                 SaveWindowPlacement(hwndDlg);
+                SaveLastInput();
+            }
             return 0;
         }
 
         case WM_NCDESTROY:
         {
             if (hLineBrush) { DeleteObject(hLineBrush); hLineBrush = NULL; }
+            FreeLinkIcons();
             return 0;
         }
 
@@ -957,10 +1268,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)nCmdShow;
 
     // Single instance
-    HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\TimerResTool_SingleInstance");
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\ResTimer_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        HWND hExisting = FindWindowA(NULL, "New Timer Resolution");
+        HWND hExisting = FindWindowA(NULL, APP_NAME);
         if (hExisting)
         {
             if (IsIconic(hExisting)) ShowWindow(hExisting, SW_RESTORE);
@@ -970,6 +1281,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
 
+    MigrateLegacyConfig();
     LoadNtFunctions();
     gMsgTaskbarCreated = RegisterWindowMessageA("TaskbarCreated");
 

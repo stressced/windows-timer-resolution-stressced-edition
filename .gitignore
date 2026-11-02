@@ -1,7 +1,7 @@
 # Archivos de compilación
 build.log
 *.exe
-!timeres.exe
+!ResTimer.exe
 
 # Archivos de prueba
 test.c
